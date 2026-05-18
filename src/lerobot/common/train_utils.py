@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import shutil
 from pathlib import Path
 
 from torch.optim import Optimizer
@@ -140,6 +141,28 @@ def save_training_state(
         save_optimizer_state(optimizer, save_dir)
     if scheduler is not None:
         save_scheduler_state(scheduler, save_dir)
+
+
+def delete_old_checkpoints(output_dir: Path, keep_last_n: int) -> None:
+    """Delete the oldest checkpoints, keeping only the last `keep_last_n`.
+
+    Args:
+        output_dir: The top-level output directory that contains the 'checkpoints/' folder.
+        keep_last_n: Number of most recent checkpoints to keep.
+    """
+    checkpoints_dir = output_dir / CHECKPOINTS_DIR
+    if not checkpoints_dir.is_dir():
+        return
+    # Collect real directories (skip the 'last' symlink)
+    checkpoint_dirs = sorted(
+        [d for d in checkpoints_dir.iterdir() if d.is_dir() and not d.is_symlink()],
+        key=lambda d: d.name,
+    )
+    if len(checkpoint_dirs) <= keep_last_n:
+        return
+    dirs_to_delete = checkpoint_dirs[: len(checkpoint_dirs) - keep_last_n]
+    for d in dirs_to_delete:
+        shutil.rmtree(d)
 
 
 def load_training_state(

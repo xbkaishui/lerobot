@@ -348,7 +348,7 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
     trust_remote_code: bool = True
     max_action_tokens: int = 256
     fast_skip_tokens: int = 128
-    paligemma_tokenizer_name: str = "google/paligemma-3b-pt-224"
+    paligemma_tokenizer_name: str = "/root/autodl-fs/ckpts/models/google/paligemma-3b-pt-224"
     # Internal tokenizer instance (not part of the config)
     action_tokenizer: Any = field(default=None, init=False, repr=False)
     _paligemma_tokenizer: Any = field(default=None, init=False, repr=False)

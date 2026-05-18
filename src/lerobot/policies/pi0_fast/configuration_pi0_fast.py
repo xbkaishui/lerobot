@@ -59,7 +59,7 @@ class PI0FastConfig(PreTrainedConfig):
     empty_cameras: int = 0
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
-    text_tokenizer_name: str = "google/paligemma-3b-pt-224"
+    text_tokenizer_name: str = "/root/autodl-fs/ckpts/models/google/paligemma-3b-pt-224"
     action_tokenizer_name: str = "lerobot/fast-action-tokenizer"
     temperature: float = 0.0
     max_decoding_steps: int = 256

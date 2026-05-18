@@ -34,13 +34,14 @@ from torch.optim import Optimizer
 from tqdm import tqdm
 
 from lerobot.common.train_utils import (
+    delete_old_checkpoints,
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_state,
     save_checkpoint,
     update_last_checkpoint,
 )
-from lerobot.common.wandb_utils import WandBLogger
+from lerobot.common.swandb_utils import SWandBLogger
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import EpisodeAwareSampler, make_dataset
@@ -213,7 +214,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     # Initialize wandb only on main process
     if cfg.wandb.enable and cfg.wandb.project and is_main_process:
-        wandb_logger = WandBLogger(cfg)
+        wandb_logger = SWandBLogger(cfg)
     else:
         wandb_logger = None
         if is_main_process:
@@ -512,6 +513,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     postprocessor=postprocessor,
                 )
                 update_last_checkpoint(checkpoint_dir)
+                if cfg.keep_last_n_checkpoints is not None:
+                    delete_old_checkpoints(cfg.output_dir, cfg.keep_last_n_checkpoints)
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
 
