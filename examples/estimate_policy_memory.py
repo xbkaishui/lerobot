@@ -87,13 +87,14 @@ class MemoryReport:
     kv_cache: int = 0
     gradients: int = 0
     optimizer_states: int = 0
+    compile_overhead: int = 0  # torch.compile 图捕获 + 融合缓冲 + autotuning
     cuda_overhead: int = int(1.2 * 1024**3)  # 经验：CUDA context + workspace
 
     notes: list[str] = field(default_factory=list)
 
     @property
     def inference_total(self) -> int:
-        return self.weights + self.activations + self.kv_cache + self.cuda_overhead
+        return self.weights + self.activations + self.kv_cache + self.compile_overhead + self.cuda_overhead
 
     @property
     def training_total(self) -> int:
@@ -102,6 +103,7 @@ class MemoryReport:
             + self.activations
             + self.gradients
             + self.optimizer_states
+            + self.compile_overhead
             + self.cuda_overhead
         )
 
@@ -132,6 +134,8 @@ class MemoryReport:
         if training:
             lines.append(f"  Gradients           : {_human(self.gradients)}")
             lines.append(f"  Optimizer (AdamW)   : {_human(self.optimizer_states)}")
+        if self.compile_overhead:
+            lines.append(f"  torch.compile extra : {_human(self.compile_overhead)}")
         lines.append(f"  CUDA overhead       : {_human(self.cuda_overhead)}")
         lines.append("-" * 68)
         if training:
@@ -142,6 +146,57 @@ class MemoryReport:
         for note in self.notes:
             lines.append(f"note: {note}")
         return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# torch.compile overhead estimation
+# ---------------------------------------------------------------------------
+
+# 经验系数：torch.compile 的额外显存来自图捕获缓冲、融合 kernel workspace、
+# autotuning 候选缓存。大小与模型结构相关：
+#   - 规则的堆叠 Transformer（如 pi0/pi05）：编译后复用率高，开销较低 (~15% of activations)
+#   - 含分支/动态逻辑的模型（ACT decoder、diffusion UNet）：graph break 多，开销较高 (~20%)
+#   - mode="reduce-overhead" (CUDA Graphs)：额外固定 ~200MB 图录制开销
+_COMPILE_FACTOR = {
+    "pi0": 0.15,
+    "pi05": 0.15,
+    "act": 0.20,
+    "diffusion": 0.25,  # UNet 的 skip connections 导致更多中间 buffer
+    "smolvla": 0.18,
+    "vqbet": 0.20,
+}
+_COMPILE_FACTOR_DEFAULT = 0.20
+_CUDA_GRAPHS_FIXED_OVERHEAD = int(200 * 1024**2)  # ~200 MB
+
+
+def _estimate_compile_overhead(
+    policy_type: str,
+    activations: int,
+    weights: int,
+    compile_mode: str = "default",
+) -> int:
+    """估算 torch.compile 引入的额外显存。
+
+    开销主要与 activations 相关（图捕获时需保留中间张量副本用于 shape propagation
+    和 kernel fusion workspace），同时受 compile_mode 影响：
+      - "default": 仅 Inductor 图融合，开销 = factor * activations
+      - "reduce-overhead": 启用 CUDA Graphs，额外锁定 ~200MB 静态显存
+      - "max-autotune": Inductor + triton autotuning，开销再加 ~5%（候选 kernel 缓存）
+    """
+    factor = _COMPILE_FACTOR.get(policy_type, _COMPILE_FACTOR_DEFAULT)
+
+    # 基础开销：与激活成比例
+    overhead = int(activations * factor)
+
+    # CUDA Graphs 模式额外固定开销
+    if compile_mode == "reduce-overhead":
+        overhead += _CUDA_GRAPHS_FIXED_OVERHEAD
+
+    # max-autotune 会在编译阶段缓存更多 kernel 变体
+    if compile_mode == "max-autotune":
+        overhead += int(activations * 0.05)
+
+    return overhead
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +555,14 @@ def main() -> None:
     parser.add_argument("--train_expert_only", action="store_true")
 
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+
+    # torch.compile knobs
+    parser.add_argument("--compile", action="store_true",
+                        help="Include torch.compile overhead in estimate.")
+    parser.add_argument("--compile_mode", default="default",
+                        choices=["default", "reduce-overhead", "max-autotune"],
+                        help="torch.compile mode. Affects overhead estimate.")
+
     args = parser.parse_args()
 
     cfg = _prepare_config(args)
@@ -511,6 +574,21 @@ def main() -> None:
             report = _estimate_pi_family(args.policy_type, cfg, args.batch_size)
         else:
             report = _generic_estimate(args.policy_type, cfg, args.batch_size)
+
+    # Apply torch.compile overhead if requested
+    if args.compile:
+        compile_extra = _estimate_compile_overhead(
+            args.policy_type,
+            activations=report.activations,
+            weights=report.weights,
+            compile_mode=args.compile_mode,
+        )
+        report.compile_overhead = compile_extra
+        report.notes.append(
+            f"torch.compile(mode='{args.compile_mode}') → "
+            f"extra {_human(compile_extra)} "
+            f"(factor={_COMPILE_FACTOR.get(args.policy_type, _COMPILE_FACTOR_DEFAULT):.0%} of activations)"
+        )
 
     print(report.pretty(training=args.train))
 

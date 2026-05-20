@@ -101,6 +101,17 @@ class TrainPipelineConfig(HubMixin):
     persistent_workers: bool = True
     steps: int = 100_000
     eval_freq: int = 20_000
+    # `val_freq`: compute validation loss every N steps. Set to 0 to disable validation loss.
+    # Useful when there is no simulation environment for online rollout evaluation.
+    val_freq: int = 0
+    # `val_ratio`: fraction of episodes used as the validation split (drawn from the
+    # current `cfg.dataset.episodes` if specified, otherwise from all episodes). Train and
+    # validation episodes are disjoint and the split is deterministic given `cfg.seed`.
+    val_ratio: float = 0.1
+    # `val_batch_size`: batch size for validation forward passes. Defaults to 0 which
+    # means auto (max(1, batch_size // 2)). Set to a small value (e.g. 1) when GPU memory
+    # is tight (e.g. large VLA models with torch.compile / CUDA graphs).
+    val_batch_size: int = 0
     log_freq: int = 200
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True

@@ -20,6 +20,7 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 
 import dataclasses
 import logging
+import random
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -29,6 +30,10 @@ if TYPE_CHECKING:
     from accelerate import Accelerator
 
 import torch
+import torch._dynamo
+# 减少缓存数量，节省显存
+torch._dynamo.config.cache_size_limit = 2
+
 from termcolor import colored
 from torch.optim import Optimizer
 from tqdm import tqdm
@@ -61,6 +66,67 @@ from lerobot.utils.utils import (
 )
 
 from .lerobot_eval import eval_policy_all
+
+
+@torch.no_grad()
+def evaluate_validation_loss(
+    policy: PreTrainedPolicy,
+    val_dataloader: torch.utils.data.DataLoader,
+    preprocessor,
+    camera_keys: list[str],
+    accelerator: "Accelerator",
+) -> float:
+    """
+    Compute the average loss on the validation split (no gradient).
+
+    The policy is set to eval mode, then restored to train mode after the loop.
+    Results are reduced across all accelerator processes so every rank gets the
+    same scalar value.
+
+    To avoid extra compilation time and CUDA graph memory overhead, this function
+    uses the *uncompiled* model (accessed via ``_orig_mod``) when torch.compile
+    was applied.
+
+    Args:
+        policy: The policy model (possibly compiled & DDP-wrapped).
+        val_dataloader: DataLoader over the held-out validation frames.
+        preprocessor: The same preprocessor used for training batches.
+        camera_keys: Camera feature keys whose uint8 tensors need float conversion.
+        accelerator: Accelerator instance (handles autocast & distributed reduce).
+
+    Returns:
+        The mean validation loss as a Python float.
+    """
+    # Free cached GPU memory before validation to avoid OOM with compiled models /
+    # CUDA graphs that pin large amounts of memory during training.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Use the uncompiled (eager) model for validation to avoid:
+    # 1) Recompilation overhead when val batch_size differs from training
+    # 2) New CUDA graph allocations that consume extra GPU memory
+    unwrapped = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    eval_model = getattr(unwrapped, "_orig_mod", unwrapped)
+
+    eval_model.eval()
+    total_loss = torch.tensor(0.0, device=accelerator.device)
+    n_batches = torch.tensor(0, device=accelerator.device)
+    with accelerator.autocast():
+        for batch in val_dataloader:
+            for cam_key in camera_keys:
+                if cam_key in batch and batch[cam_key].dtype == torch.uint8:
+                    batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
+            batch = preprocessor(batch)
+            loss, _ = eval_model.forward(batch)
+            total_loss += loss.detach()
+            n_batches += 1
+    # Reduce across processes
+    total_loss = accelerator.reduce(total_loss, reduction="sum")
+    n_batches = accelerator.reduce(n_batches, reduction="sum")
+    eval_model.train()
+    if n_batches.item() == 0:
+        return 0.0
+    return (total_loss / n_batches).item()
 
 
 def update_policy(
@@ -243,6 +309,36 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
+    # --- Validation split ---
+    # When val_freq > 0, split episodes into disjoint train / val sets so that
+    # a validation loss can be computed periodically (helpful when there is no
+    # simulation environment for online rollout evaluation).
+    train_episodes = None  # None means "use all episodes" (unchanged behaviour)
+    val_episodes: list[int] | None = None
+    if cfg.val_freq > 0 and not cfg.dataset.streaming:
+        available_eps = (
+            list(dataset.episodes) if dataset.episodes is not None
+            else list(range(dataset.num_episodes))
+        )
+        if len(available_eps) < 2:
+            if is_main_process:
+                logging.warning(
+                    "val_freq > 0 but only %d episode(s) available — skipping validation split.",
+                    len(available_eps),
+                )
+        else:
+            rng_split = random.Random(cfg.seed if cfg.seed is not None else 42)
+            shuffled = available_eps.copy()
+            rng_split.shuffle(shuffled)
+            n_val = max(1, int(len(shuffled) * cfg.val_ratio))
+            val_episodes = sorted(shuffled[:n_val])
+            train_episodes = sorted(shuffled[n_val:])
+            if is_main_process:
+                logging.info(
+                    f"Validation split: {len(train_episodes)} train episodes, "
+                    f"{len(val_episodes)} val episodes"
+                )
+
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -394,13 +490,23 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],
             dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
+            episode_indices_to_use=train_episodes if train_episodes is not None else dataset.episodes,
             drop_n_last_frames=active_cfg.drop_n_last_frames,
             shuffle=True,
         )
     else:
-        shuffle = True
-        sampler = None
+        if train_episodes is not None:
+            # Build frame-level indices for the training episodes only
+            train_indices = []
+            for ep_idx in train_episodes:
+                from_idx = int(dataset.meta.episodes["dataset_from_index"][ep_idx])
+                to_idx = int(dataset.meta.episodes["dataset_to_index"][ep_idx])
+                train_indices.extend(range(from_idx, to_idx))
+            sampler = torch.utils.data.SubsetRandomSampler(train_indices)
+            shuffle = False
+        else:
+            shuffle = True
+            sampler = None
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -414,11 +520,35 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
     )
 
+    # --- Validation dataloader ---
+    val_dataloader = None
+    if val_episodes is not None:
+        val_indices = []
+        for ep_idx in val_episodes:
+            from_idx = int(dataset.meta.episodes["dataset_from_index"][ep_idx])
+            to_idx = int(dataset.meta.episodes["dataset_to_index"][ep_idx])
+            val_indices.extend(range(from_idx, to_idx))
+        val_subset = torch.utils.data.Subset(dataset, val_indices)
+        val_dataloader = torch.utils.data.DataLoader(
+            val_subset,
+            num_workers=cfg.num_workers,
+            batch_size=cfg.val_batch_size if cfg.val_batch_size > 0 else max(1, cfg.batch_size // 2),
+            shuffle=False,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+        )
+        if is_main_process:
+            logging.info(
+                f"Val dataloader: {len(val_indices)} frames, {len(val_episodes)} episodes"
+            )
+
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         policy, optimizer, dataloader, lr_scheduler
     )
+    if val_dataloader is not None:
+        val_dataloader = accelerator.prepare(val_dataloader)
     dl_iter = cycle(dataloader)
 
     policy.train()
@@ -484,6 +614,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        is_val_step = cfg.val_freq > 0 and step % cfg.val_freq == 0 and val_dataloader is not None
 
         if is_log_step:
             logging.info(train_tracker)
@@ -519,6 +650,26 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     wandb_logger.log_policy(checkpoint_dir)
 
             accelerator.wait_for_everyone()
+
+        # --- Validation loss ---
+        if is_val_step:
+            val_start = time.perf_counter()
+            val_loss = evaluate_validation_loss(
+                policy=policy,
+                val_dataloader=val_dataloader,
+                preprocessor=preprocessor,
+                camera_keys=dataset.meta.camera_keys,
+                accelerator=accelerator,
+            )
+            val_s = time.perf_counter() - val_start
+            if is_main_process:
+                logging.info(f"Step {step} | val_loss: {val_loss:.4f} | val_s: {val_s:.2f}s")
+                if wandb_logger:
+                    wandb_logger.log_dict(
+                        {"val_loss": val_loss, "val_s": val_s},
+                        step,
+                        mode="eval",
+                    )
 
         if cfg.env and is_eval_step:
             if is_main_process:

@@ -228,7 +228,7 @@ def rollout(
         all_actions.append(torch.from_numpy(action_numpy))
         all_rewards.append(torch.from_numpy(reward))
         all_dones.append(torch.from_numpy(done))
-        all_successes.append(torch.tensor(successes))
+        all_successes.append(torch.tensor([bool(s) for s in successes]))
 
         step += 1
         running_success_rate = (
