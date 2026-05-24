@@ -47,6 +47,7 @@ from lerobot.utils.feature_utils import dataset_to_policy_features
 from .act.configuration_act import ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config
+from .fastwam.configuration_fastwam import FastWAMConfig
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig
 from .groot.configuration_groot import GrootConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
@@ -151,6 +152,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .eo1.modeling_eo1 import EO1Policy
 
         return EO1Policy
+    elif name == "fastwam":
+        from .fastwam.modeling_fastwam import FastWAMPolicy
+
+        return FastWAMPolicy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
@@ -203,6 +208,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return WallXConfig(**kwargs)
     elif policy_type == "eo1":
         return EO1Config(**kwargs)
+    elif policy_type == "fastwam":
+        return FastWAMConfig(**kwargs)
     else:
         try:
             config_cls = PreTrainedConfig.get_choice_class(policy_type)
@@ -304,6 +311,10 @@ def make_pre_post_processors(
             to_output=transition_to_policy_action,
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
+        if isinstance(policy_cfg, FastWAMConfig):
+            from .fastwam.processor_fastwam import migrate_fastwam_postprocessor
+
+            postprocessor = migrate_fastwam_postprocessor(postprocessor, policy_cfg)
         return preprocessor, postprocessor
 
     # Create a new processor based on policy type
@@ -410,6 +421,14 @@ def make_pre_post_processors(
         from .eo1.processor_eo1 import make_eo1_pre_post_processors
 
         processors = make_eo1_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, FastWAMConfig):
+        from .fastwam.processor_fastwam import make_fastwam_pre_post_processors
+
+        processors = make_fastwam_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
