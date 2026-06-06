@@ -200,7 +200,66 @@ class ActionHead(nn.Module):
         return self.proj(self.norm(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1))
 
 
+def _interpolate_last_dim(tensor: torch.Tensor, new_size: int) -> torch.Tensor:
+    """Interpolate the last dimension of a tensor to `new_size` using linear interpolation."""
+    if tensor.shape[-1] == new_size:
+        return tensor
+    flat = tensor.reshape(-1, 1, tensor.shape[-1]).to(torch.float32)
+    flat = functional.interpolate(flat, size=new_size, mode="linear", align_corners=True)
+    return flat.reshape(*tensor.shape[:-1], new_size)
+
+
+def _resize_tensor_to_shape(src: torch.Tensor, target_shape: tuple[int, ...]) -> torch.Tensor:
+    """Resize `src` to `target_shape` by sequentially interpolating each differing dimension."""
+    if tuple(src.shape) == tuple(target_shape):
+        return src
+
+    out = src.to(torch.float32)
+    # Adjust rank if needed
+    while out.ndim < len(target_shape):
+        out = out.unsqueeze(0)
+    while out.ndim > len(target_shape):
+        if out.shape[0] != 1:
+            raise ValueError(
+                f"Cannot reduce tensor rank for resize: src shape={tuple(src.shape)}, target={target_shape}"
+            )
+        out = out.squeeze(0)
+
+    for dim, new_size in enumerate(target_shape):
+        current_size = out.shape[dim]
+        if current_size == new_size:
+            continue
+        # Permute target dimension to end, interpolate, restore order
+        perm = [i for i in range(out.ndim) if i != dim] + [dim]
+        inv_perm = [0] * out.ndim
+        for i, p in enumerate(perm):
+            inv_perm[p] = i
+        out_perm = out.permute(*perm).contiguous()
+        prefix_shape = out_perm.shape[:-1]
+        out_perm = _interpolate_last_dim(out_perm, new_size)
+        out_perm = out_perm.reshape(*prefix_shape, new_size)
+        out = out_perm.permute(*inv_perm).contiguous()
+
+    if tuple(out.shape) != tuple(target_shape):
+        raise ValueError(
+            f"Resize produced wrong shape: src={tuple(src.shape)}, target={target_shape}, got={tuple(out.shape)}"
+        )
+    return out.to(dtype=src.dtype)
+
+
 class ActionDiT(nn.Module):
+    ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.")
+    ACTION_BACKBONE_META_KEYS = (
+        "hidden_dim",
+        "ffn_dim",
+        "num_layers",
+        "num_heads",
+        "attn_head_dim",
+        "text_dim",
+        "freq_dim",
+        "eps",
+    )
+
     def __init__(
         self,
         hidden_dim: int,
@@ -258,6 +317,191 @@ class ActionDiT(nn.Module):
         self.freqs = precompute_freqs_cis(attn_head_dim, end=1024)
 
         self.use_gradient_checkpointing = use_gradient_checkpointing
+
+    @classmethod
+    def backbone_key_set(cls, keys) -> set[str]:
+        """Return the set of state_dict keys that belong to the backbone (shared with video expert)."""
+        return {
+            key
+            for key in keys
+            if not any(key.startswith(prefix) for prefix in cls.ACTION_BACKBONE_SKIP_PREFIXES)
+        }
+
+    @classmethod
+    def from_wan22_pretrained(
+        cls,
+        action_dit_config: dict[str, Any],
+        action_dit_pretrained_path: str | None = None,
+        video_expert_state_dict: dict[str, torch.Tensor] | None = None,
+        apply_alpha_scaling: bool = True,
+        device: str = "cuda",
+        torch_dtype: torch.dtype = torch.bfloat16,
+    ) -> "ActionDiT":
+        """Create an ActionDiT with backbone weights initialized from Video Expert.
+
+        Supports two modes:
+        1. Load from a preprocessed `.pt` payload file (``action_dit_pretrained_path``).
+        2. Directly copy backbone weights from a loaded video expert state dict
+           (``video_expert_state_dict``), with linear interpolation for shape mismatches
+           and optional alpha scaling.
+
+        If neither is provided, returns a randomly initialized ActionDiT.
+
+        Args:
+            action_dit_config: kwargs dict for ActionDiT constructor.
+            action_dit_pretrained_path: Path to preprocessed `.pt` backbone payload.
+            video_expert_state_dict: state_dict from the video expert (WanVideoDiT).
+            apply_alpha_scaling: Whether to apply sqrt(d_src/d_tgt) scaling when the
+                last dimension is resized.
+            device: Target device.
+            torch_dtype: Target dtype.
+        """
+        if action_dit_config is None:
+            raise ValueError("`action_dit_config` is required for ActionDiT.from_wan22_pretrained().")
+
+        action_expert = cls(**action_dit_config).to(device=device, dtype=torch_dtype)
+
+        if action_dit_pretrained_path:
+            return cls._load_from_pretrained_payload(
+                action_expert, action_dit_pretrained_path, action_dit_config, device, torch_dtype
+            )
+
+        if video_expert_state_dict is not None:
+            return cls._init_backbone_from_video_expert(
+                action_expert, video_expert_state_dict, apply_alpha_scaling, device, torch_dtype
+            )
+
+        logger.info("No pretrained path or video expert state dict provided; ActionDiT initialized randomly.")
+        return action_expert
+
+    @classmethod
+    def _load_from_pretrained_payload(
+        cls,
+        action_expert: "ActionDiT",
+        pretrained_path: str,
+        action_dit_config: dict[str, Any],
+        device: str,
+        torch_dtype: torch.dtype,
+    ) -> "ActionDiT":
+        """Load backbone from a preprocessed .pt payload file."""
+        from pathlib import Path
+
+        p = Path(pretrained_path)
+        if not p.exists():
+            raise FileNotFoundError(f"`action_dit_pretrained_path` does not exist: {pretrained_path}")
+
+        payload = torch.load(str(p), map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid payload type from {pretrained_path}: {type(payload)}")
+
+        policy_info = payload.get("policy", {})
+        if policy_info:
+            logger.info(f"ActionDiT backbone payload policy: {policy_info}")
+
+        # Validate meta
+        meta = payload.get("meta")
+        if meta is not None:
+            for key in cls.ACTION_BACKBONE_META_KEYS:
+                if key not in meta:
+                    continue
+                expected = action_dit_config.get(key)
+                if expected is None:
+                    continue
+                got = meta[key]
+                if key == "eps":
+                    if abs(float(got) - float(expected)) > 1e-12:
+                        raise ValueError(
+                            f"`meta.{key}` mismatch: expected {expected}, got {got}"
+                        )
+                elif int(got) != int(expected):
+                    raise ValueError(
+                        f"`meta.{key}` mismatch: expected {expected}, got {got}"
+                    )
+
+        backbone_state_dict = payload.get("backbone_state_dict")
+        if not isinstance(backbone_state_dict, dict):
+            raise ValueError(
+                f"`backbone_state_dict` must be a dict in {pretrained_path}, got {type(backbone_state_dict)}"
+            )
+
+        action_state = action_expert.state_dict()
+        expected_backbone_keys = cls.backbone_key_set(action_state.keys())
+        provided_keys = set(backbone_state_dict.keys())
+        missing_keys = sorted(expected_backbone_keys - provided_keys)
+        unexpected_keys = sorted(provided_keys - expected_backbone_keys)
+
+        if missing_keys:
+            logger.warning(f"Missing backbone keys in payload (will keep random init): {missing_keys[:10]}")
+        if unexpected_keys:
+            logger.warning(f"Unexpected backbone keys in payload (ignored): {unexpected_keys[:10]}")
+
+        merged_state = dict(action_state)
+        for key in expected_backbone_keys & provided_keys:
+            value = backbone_state_dict[key]
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(f"`backbone_state_dict[{key}]` must be torch.Tensor, got {type(value)}")
+            target = merged_state[key]
+            if tuple(value.shape) != tuple(target.shape):
+                raise ValueError(
+                    f"Shape mismatch for `{key}`: expected {tuple(target.shape)}, got {tuple(value.shape)}"
+                )
+            merged_state[key] = value.to(device=target.device, dtype=target.dtype)
+
+        action_expert.load_state_dict(merged_state, strict=True)
+        logger.info(
+            "Loaded ActionDiT backbone from %s (backbone_keys=%d, skipped_prefixes=%s).",
+            pretrained_path,
+            len(expected_backbone_keys & provided_keys),
+            list(cls.ACTION_BACKBONE_SKIP_PREFIXES),
+        )
+        return action_expert.to(device=device, dtype=torch_dtype)
+
+    @classmethod
+    def _init_backbone_from_video_expert(
+        cls,
+        action_expert: "ActionDiT",
+        video_expert_state_dict: dict[str, torch.Tensor],
+        apply_alpha_scaling: bool,
+        device: str,
+        torch_dtype: torch.dtype,
+    ) -> "ActionDiT":
+        """Initialize backbone weights by copying (and resizing) from video expert state dict."""
+        action_state = action_expert.state_dict()
+        backbone_keys = cls.backbone_key_set(action_state.keys())
+
+        copied = 0
+        interpolated = 0
+        skipped = 0
+
+        merged_state = dict(action_state)
+        for key in sorted(backbone_keys):
+            if key not in video_expert_state_dict:
+                skipped += 1
+                continue
+            src = video_expert_state_dict[key]
+            target = action_state[key]
+
+            if tuple(src.shape) == tuple(target.shape):
+                merged_state[key] = src.to(device=target.device, dtype=target.dtype)
+                copied += 1
+            else:
+                value = _resize_tensor_to_shape(src, tuple(target.shape))
+                if apply_alpha_scaling and src.ndim >= 2 and src.shape[-1] != target.shape[-1]:
+                    alpha = (float(src.shape[-1]) / float(target.shape[-1])) ** 0.5
+                    value = value.to(torch.float32) * alpha
+                merged_state[key] = value.detach().to(dtype=target.dtype, device=target.device)
+                interpolated += 1
+
+        action_expert.load_state_dict(merged_state, strict=True)
+        logger.info(
+            "Initialized ActionDiT backbone from video expert "
+            "(copied=%d, interpolated=%d, skipped=%d, random_kept_prefixes=%s).",
+            copied,
+            interpolated,
+            skipped,
+            list(cls.ACTION_BACKBONE_SKIP_PREFIXES),
+        )
+        return action_expert.to(device=device, dtype=torch_dtype)
 
     def pre_dit(
         self,
@@ -1008,6 +1252,9 @@ class FastWAM(torch.nn.Module):
         proprio_dim: int | None = None,
         video_dit_config: dict[str, Any] | None = None,
         action_dit_config: dict[str, Any] | None = None,
+        action_dit_pretrained_path: str | None = None,
+        init_action_from_video_backbone: bool = False,
+        apply_alpha_scaling: bool = True,
         mot_checkpoint_mixed_attn: bool = True,
         video_train_shift: float = 5.0,
         video_infer_shift: float = 5.0,
@@ -1018,6 +1265,17 @@ class FastWAM(torch.nn.Module):
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
     ):
+        """Create a FastWAM model from pretrained Wan2.2-TI2V-5B components.
+
+        Args:
+            action_dit_pretrained_path: Path to a preprocessed `.pt` backbone payload
+                for initializing ActionDiT (produced by preprocess_action_dit_backbone script).
+            init_action_from_video_backbone: If True and no pretrained_path is provided,
+                initialize ActionDiT backbone weights directly from the video expert
+                with linear interpolation for shape mismatches.
+            apply_alpha_scaling: Whether to apply sqrt(d_src/d_tgt) scaling when resizing
+                the last dimension (only used with init_action_from_video_backbone).
+        """
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
         if "text_dim" not in video_dit_config:
@@ -1034,7 +1292,26 @@ class FastWAM(torch.nn.Module):
         )
 
         video_expert = components.dit
-        action_expert = ActionDiT(**action_dit_config).to(device=device, dtype=torch_dtype)
+
+        # Initialize ActionDiT: from pretrained payload, from video backbone, or randomly
+        if action_dit_pretrained_path:
+            action_expert = ActionDiT.from_wan22_pretrained(
+                action_dit_config=action_dit_config,
+                action_dit_pretrained_path=action_dit_pretrained_path,
+                device=device,
+                torch_dtype=torch_dtype,
+            )
+        elif init_action_from_video_backbone:
+            action_expert = ActionDiT.from_wan22_pretrained(
+                action_dit_config=action_dit_config,
+                video_expert_state_dict=video_expert.state_dict(),
+                apply_alpha_scaling=apply_alpha_scaling,
+                device=device,
+                torch_dtype=torch_dtype,
+            )
+        else:
+            action_expert = ActionDiT(**action_dit_config).to(device=device, dtype=torch_dtype)
+
         if int(action_expert.num_heads) != int(video_expert.num_heads):
             raise ValueError("ActionDiT `num_heads` must match video expert for MoT mixed attention.")
         if int(action_expert.attn_head_dim) != int(video_expert.attn_head_dim):

@@ -169,6 +169,9 @@ class FastWAMConfig(PreTrainedConfig):
     loss: dict[str, float] = field(default_factory=lambda: {"lambda_video": 1.0, "lambda_action": 1.0})
     video_dit_config: dict[str, Any] | None = None
     action_dit_config: dict[str, Any] | None = None
+    action_dit_pretrained_path: str | None = None
+    init_action_from_video_backbone: bool = False
+    apply_alpha_scaling: bool = True
     invert_dimensions: list[int] = field(default_factory=list)
     normalization_mapping: dict[str, Any] = field(
         default_factory=lambda: {
