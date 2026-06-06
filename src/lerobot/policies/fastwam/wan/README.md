@@ -12,7 +12,6 @@ Copied files:
 - `wan/modules/model.py`
 - `wan/modules/t5.py`
 - `wan/modules/tokenizers.py`
-- `wan/modules/vae2_1.py`
 - `wan/modules/vae2_2.py`
 - `wan/modules/__init__.py`
 - `wan/utils/fm_solvers.py`
