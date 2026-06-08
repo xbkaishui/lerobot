@@ -147,6 +147,7 @@ class FastWAMConfig(PreTrainedConfig):
     tokenizer_model_id: str = WAN22_MODEL_ID
     tokenizer_max_len: int = 128
     load_text_encoder: bool = True
+    prompt_cache_dir: str = "/root/autodl-fs/ckpts/fast_wam/text_embeding_lerobot_cache/libero"
     mot_checkpoint_mixed_attn: bool = False
     torch_dtype: str = "bfloat16"
     prompt_template: str = (

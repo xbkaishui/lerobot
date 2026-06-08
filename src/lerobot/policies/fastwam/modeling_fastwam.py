@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import shutil
 from collections import deque
 from pathlib import Path
@@ -27,6 +29,8 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .configuration_fastwam import FastWAMConfig
+
+_logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .wan_components import WanCheckpointPaths
@@ -155,41 +159,98 @@ class FastWAMPolicy(PreTrainedPolicy):
         self._action_queue: deque[Tensor] = deque([], maxlen=self.config.n_action_steps)
         self._prompt_cache: dict[str, tuple[Tensor, Tensor]] = {}
 
+
     def _encode_prompt_cached(self, task: str | list[str] | tuple[str, ...]) -> tuple[Tensor, Tensor]:
-        """Encode task text to context/context_mask with per-prompt caching."""
+        """Encode task text to context/context_mask with 3-level caching:
+        1. In-memory dict cache (fastest)
+        2. Disk cache (persistent across runs)
+        3. Model encode_prompt (slowest, only on cache miss)
+        """
         if isinstance(task, str):
             prompts = [task]
         else:
             prompts = list(task)
 
-        contexts = []
-        masks = []
-        uncached_prompts = []
-        uncached_indices = []
+        contexts: list[Tensor | None] = []
+        masks: list[Tensor | None] = []
+        uncached_prompts: list[str] = []
+        uncached_indices: list[int] = []
 
         for i, p in enumerate(prompts):
+            # Level 1: in-memory cache
             if p in self._prompt_cache:
                 ctx, msk = self._prompt_cache[p]
                 contexts.append(ctx)
                 masks.append(msk)
-            else:
-                uncached_prompts.append(p)
-                uncached_indices.append(i)
-                contexts.append(None)
-                masks.append(None)
+                continue
 
+            # Level 2: disk cache
+            disk_ctx, disk_msk = self._load_from_disk_cache(p)
+            if disk_ctx is not None and disk_msk is not None:
+                self._prompt_cache[p] = (disk_ctx, disk_msk)
+                contexts.append(disk_ctx)
+                masks.append(disk_msk)
+                continue
+
+            # Level 3: need model encoding
+            uncached_prompts.append(p)
+            uncached_indices.append(i)
+            contexts.append(None)
+            masks.append(None)
+
+        # Batch encode all cache-missed prompts
         if uncached_prompts:
+            _logger.info("Encoding %d prompts via text encoder...", len(uncached_prompts))
             with torch.no_grad():
                 new_ctx, new_mask = self.model.encode_prompt(uncached_prompts)
-                print(f"Encoded {uncached_prompts} to ctx shape {new_ctx.shape} mask shape {new_mask.shape}")
             for j, idx in enumerate(uncached_indices):
                 ctx_j = new_ctx[j : j + 1]
                 mask_j = new_mask[j : j + 1]
+                # Save to memory + disk
                 self._prompt_cache[uncached_prompts[j]] = (ctx_j, mask_j)
+                self._save_to_disk_cache(uncached_prompts[j], ctx_j, mask_j)
                 contexts[idx] = ctx_j
                 masks[idx] = mask_j
 
         return torch.cat(contexts, dim=0), torch.cat(masks, dim=0)
+
+    def _prompt_cache_path(self, prompt: str) -> Path:
+        """Generate a stable file path for a prompt's disk cache."""
+        key = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        cache_dir = Path(self.config.prompt_cache_dir)
+        return cache_dir / f"{key}.pt"
+
+    def _load_from_disk_cache(self, prompt: str) -> tuple[Tensor | None, Tensor | None]:
+        """Try to load cached context/context_mask from disk."""
+        path = self._prompt_cache_path(prompt)
+        if not path.exists():
+            return None, None
+        try:
+            data = torch.load(path, map_location="cpu", weights_only=True)
+            ctx = data["context"]  # [1, seq_len, hidden_dim]
+            msk = data["context_mask"]  # [1, seq_len]
+            # Move to model device
+            device = next(self.parameters()).device
+            ctx = ctx.to(device=device)
+            msk = msk.to(device=device)
+            _logger.debug("Disk cache hit: %s", prompt[:60])
+            return ctx, msk
+        except Exception as e:
+            _logger.warning("Failed to load disk cache for prompt: %s", e)
+            return None, None
+
+    def _save_to_disk_cache(self, prompt: str, context: Tensor, context_mask: Tensor) -> None:
+        """Persist context/context_mask to disk for future runs."""
+        path = self._prompt_cache_path(prompt)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            torch.save(
+                {"context": context.cpu(), "context_mask": context_mask.cpu(), "prompt": prompt},
+                path,
+            )
+            _logger.debug("Saved disk cache: %s", path)
+        except Exception as e:
+            _logger.warning("Failed to save disk cache: %s", e)
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Compute FastWAM training loss for a LeRobot batch.

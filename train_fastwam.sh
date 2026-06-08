@@ -1,7 +1,7 @@
 # trap '' HUP
 export HF_HOME=/root/autodl-tmp/hf_cache
 export HF_DATASETS_CACHE=/root/autodl-tmp/hf_cache/datasets
-# export HF_DATASETS_IN_MEMORY=1
+export HF_DATASETS_IN_MEMORY=1
 # export HF_ENDPOINT=https://hf-mirror.com
 # export HF_HUB_ENABLE_HF_TRANSFER=1
 # try uninstall numpy
@@ -31,6 +31,7 @@ accelerate launch  \
 --batch_size=1 \
 --save_freq=2000  \
 --keep_last_n_checkpoints=3 \
+--policy.load_text_encoder=false \
 --policy.model_id=/root/autodl-fs/ckpts/models/Wan-AI/Wan2.2-TI2V-5B  \
 --policy.tokenizer_model_id=/root/autodl-fs/ckpts/models/Wan-AI/Wan2.2-TI2V-5B  \
 --num_workers=16
