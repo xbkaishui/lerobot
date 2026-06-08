@@ -146,8 +146,9 @@ class FastWAMConfig(PreTrainedConfig):
     model_id: str = WAN22_MODEL_ID
     tokenizer_model_id: str = WAN22_MODEL_ID
     tokenizer_max_len: int = 128
-    load_text_encoder: bool = True
+    load_text_encoder: bool = False
     prompt_cache_dir: str = "/root/autodl-fs/ckpts/fast_wam/text_embeding_lerobot_cache/libero"
+    use_gradient_checkpointing: bool = False
     mot_checkpoint_mixed_attn: bool = False
     torch_dtype: str = "bfloat16"
     prompt_template: str = (
@@ -200,6 +201,10 @@ class FastWAMConfig(PreTrainedConfig):
         self.normalization_mapping = _coerce_normalization_mapping(self.normalization_mapping)
         self.video_dit_config = self.video_dit_config or _default_video_dit_config(self.action_dim)
         self.action_dit_config = self.action_dit_config or _default_action_dit_config(self.action_dim)
+        # Propagate top-level use_gradient_checkpointing into both dit configs
+        if self.use_gradient_checkpointing:
+            self.video_dit_config["use_gradient_checkpointing"] = True
+            self.action_dit_config["use_gradient_checkpointing"] = True
         self.input_features = self.input_features or self._default_input_features()
         self.output_features = self.output_features or self._default_output_features()
         self.validate_features()

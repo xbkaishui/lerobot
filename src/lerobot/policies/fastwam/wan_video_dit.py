@@ -77,9 +77,10 @@ def fastwam_masked_attention(
     q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
     k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
     v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-    q = q.float()
-    k = k.float()
-    v = v.float()
+    # Ensure consistent dtype (RoPE/RMSNorm may upcast q/k to float32)
+    target_dtype = v.dtype
+    q = q.to(target_dtype)
+    k = k.to(target_dtype)
     x = functional.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
     return rearrange(x, "b n s d -> b s (n d)", n=num_heads)
 

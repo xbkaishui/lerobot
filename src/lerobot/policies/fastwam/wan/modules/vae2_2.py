@@ -2,7 +2,7 @@
 import logging
 
 import torch
-import torch.cuda.amp as amp
+import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -976,7 +976,7 @@ class Wan2_2_VAE:
         try:
             if not isinstance(videos, list):
                 raise TypeError("videos should be a list")
-            with amp.autocast(dtype=self.dtype):
+            with amp.autocast("cuda", dtype=self.dtype):
                 return [self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0) for u in videos]
         except TypeError as e:
             logging.info(e)
@@ -986,7 +986,7 @@ class Wan2_2_VAE:
         try:
             if not isinstance(zs, list):
                 raise TypeError("zs should be a list")
-            with amp.autocast(dtype=self.dtype):
+            with amp.autocast("cuda", dtype=self.dtype):
                 return [
                     self.model.decode(u.unsqueeze(0), self.scale).float().clamp_(-1, 1).squeeze(0) for u in zs
                 ]
