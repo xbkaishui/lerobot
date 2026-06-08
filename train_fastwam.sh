@@ -30,7 +30,7 @@ accelerate launch  \
 --wandb.enable=true  \
 --policy.push_to_hub=false  \
 --steps=30000  \
---batch_size=12 \
+--batch_size=16 \
 --save_freq=2000  \
 --keep_last_n_checkpoints=3 \
 --policy.use_gradient_checkpointing=true \
