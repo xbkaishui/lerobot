@@ -31,6 +31,7 @@ from lerobot.policies.fastwam.wan_components import (
     WAN_T5_TOKENIZER,
     WAN_VAE_CHECKPOINT,
     resolve_wan_checkpoint_paths,
+    load_wan22_ti2v_5b_components,
 )
 
 
@@ -160,3 +161,42 @@ def test_resolve_wan_checkpoint_paths_can_skip_text_encoder(tmp_path):
 
     assert paths.text_encoder is None
     assert paths.tokenizer is None
+
+
+def test_load_wan22_ti2v_5b_components():
+    ckpt_path = '/root/autodl-fs/ckpts/models/Wan-AI/Wan2.2-TI2V-5B'
+    device: str = "cuda"
+    torch_dtype: str = "float16"
+    video_dit_config: dict = {
+        "patch_size": [1, 2, 2],
+        "in_dim": 48,
+        "hidden_dim": 3072,
+        "ffn_dim": 14336,
+        "freq_dim": 256,
+        "text_dim": 4096,
+        "out_dim": 48,
+        "num_heads": 24,
+        "attn_head_dim": 128,
+        "num_layers": 30,
+        "eps": 1.0e-6,
+        "seperated_timestep": True,
+        "use_gradient_checkpointing": False,
+        "video_attention_mask_mode": "first_frame_causal",
+        "action_conditioned": False,
+        "action_dim": 7,
+        "action_group_causal_mask_mode": "group_diagonal",
+    }
+    load_text_encoder: bool = True
+    tokenizer_max_len: int = 512
+    components = load_wan22_ti2v_5b_components(
+            device=device,
+            torch_dtype=torch_dtype,
+            model_id=ckpt_path,
+            tokenizer_model_id=ckpt_path,
+            tokenizer_max_len=tokenizer_max_len,
+            dit_config=video_dit_config,
+            load_text_encoder=load_text_encoder,
+        )
+    
+if __name__ == "__main__":
+    test_load_wan22_ti2v_5b_components()

@@ -203,7 +203,7 @@ def load_wan22_ti2v_5b_components(
         tokenizer_dir=tokenizer_dir,
         load_text_encoder=load_text_encoder,
     )
-
+    print(f'paths {paths}')
     dit = load_wan_video_dit(
         paths.dit,
         dit_config=dit_config,
