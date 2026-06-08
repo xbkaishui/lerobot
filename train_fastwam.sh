@@ -29,10 +29,11 @@ accelerate launch  \
 --policy.device=cuda  \
 --wandb.enable=true  \
 --policy.push_to_hub=false  \
---steps=30000  \
+--steps=20000  \
 --batch_size=16 \
 --save_freq=2000  \
 --keep_last_n_checkpoints=3 \
+--policy.use_torch_compile=true \
 --policy.use_gradient_checkpointing=true \
 --policy.mot_checkpoint_mixed_attn=true \
 --policy.load_text_encoder=false \

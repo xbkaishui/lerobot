@@ -46,6 +46,7 @@ def _default_video_dit_config(action_dim: int) -> dict[str, Any]:
         "eps": 1.0e-6,
         "seperated_timestep": True,
         "use_gradient_checkpointing": False,
+        "use_torch_compile": False,
         "video_attention_mask_mode": "first_frame_causal",
         "action_conditioned": False,
         "action_dim": action_dim,
@@ -65,6 +66,7 @@ def _default_action_dit_config(action_dim: int) -> dict[str, Any]:
         "freq_dim": 256,
         "eps": 1.0e-6,
         "use_gradient_checkpointing": False,
+        "use_torch_compile": False,
     }
 
 
@@ -149,6 +151,7 @@ class FastWAMConfig(PreTrainedConfig):
     load_text_encoder: bool = False
     prompt_cache_dir: str = "/root/autodl-fs/ckpts/fast_wam/text_embeding_lerobot_cache/libero"
     use_gradient_checkpointing: bool = False
+    use_torch_compile: bool = False
     mot_checkpoint_mixed_attn: bool = False
     torch_dtype: str = "bfloat16"
     prompt_template: str = (
@@ -205,6 +208,10 @@ class FastWAMConfig(PreTrainedConfig):
         if self.use_gradient_checkpointing:
             self.video_dit_config["use_gradient_checkpointing"] = True
             self.action_dit_config["use_gradient_checkpointing"] = True
+        # Propagate top-level use_torch_compile into both dit configs
+        if self.use_torch_compile:
+            self.video_dit_config["use_torch_compile"] = True
+            self.action_dit_config["use_torch_compile"] = True
         self.input_features = self.input_features or self._default_input_features()
         self.output_features = self.output_features or self._default_output_features()
         self.validate_features()

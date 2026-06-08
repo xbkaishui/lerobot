@@ -309,6 +309,7 @@ class WanVideoDiT(WanModel):
         action_group_causal_mask_mode="causal",
         video_attention_mask_mode: str = "bidirectional",
         use_gradient_checkpointing: bool = False,
+        use_torch_compile: bool = False,
     ):
         del in_dim_control_adapter
         if has_image_input:
@@ -377,6 +378,14 @@ class WanVideoDiT(WanModel):
             logger.info(
                 "Using gradient checkpointing for DiT blocks. This will save memory but use more computation."
             )
+
+        self.use_torch_compile = use_torch_compile
+        if self.use_torch_compile:
+            logger.info("Compiling WanVideoDiT blocks with torch.compile (mode=default, dynamic=True)...")
+            self.blocks = torch.nn.ModuleList(
+                [torch.compile(block, mode="default", dynamic=True) for block in self.blocks]
+            )
+            logger.info("WanVideoDiT: %d blocks compiled.", len(self.blocks))
 
     def patchify(self, x: torch.Tensor):
         return self.patch_embedding(x)

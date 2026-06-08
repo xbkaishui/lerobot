@@ -272,6 +272,7 @@ class ActionDiT(nn.Module):
         attn_head_dim: int,
         num_layers: int,
         use_gradient_checkpointing: bool = False,
+        use_torch_compile: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -317,6 +318,14 @@ class ActionDiT(nn.Module):
         self.freqs = precompute_freqs_cis(attn_head_dim, end=1024)
 
         self.use_gradient_checkpointing = use_gradient_checkpointing
+
+        self.use_torch_compile = use_torch_compile
+        if self.use_torch_compile:
+            logger.info("Compiling ActionDiT blocks with torch.compile (mode=default, dynamic=True)...")
+            self.blocks = nn.ModuleList(
+                [torch.compile(block, mode="default", dynamic=True) for block in self.blocks]
+            )
+            logger.info("ActionDiT: %d blocks compiled.", len(self.blocks))
 
     @classmethod
     def backbone_key_set(cls, keys) -> set[str]:
