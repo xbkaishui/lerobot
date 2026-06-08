@@ -1,19 +1,21 @@
 # trap '' HUP
 export HF_HOME=/root/autodl-tmp/hf_cache
 export HF_DATASETS_CACHE=/root/autodl-tmp/hf_cache/datasets
+# export HF_DATASETS_IN_MEMORY=1
 # export HF_ENDPOINT=https://hf-mirror.com
 # export HF_HUB_ENABLE_HF_TRANSFER=1
 # try uninstall numpy
 # python3 -m pip uninstall -y numpy && rm -rf /root/miniconda3/lib/python3.12/site-packages/numpy*
 # 输出目录配置项（可通过环境变量 OUTPUT_DIR 覆盖）
-OUTPUT_DIR="${OUTPUT_DIR:-/root/autodl-tmp/ckpts/pi05/libero_pi05_0519_finetune_test}"
+OUTPUT_DIR="${OUTPUT_DIR:-/root/autodl-tmp/ckpts/fastwam/libero_fastwam_0608_finetune_test}"
 # OUTPUT_DIR="/root/autodl-fs/ckpts/pi05/libero_pi05_0519_finetune_test"
 
 rm -rf "${OUTPUT_DIR}"
+# 数据集最好放到 tmp里面去， /root/autodl-tmp/
 
-
+# accelerate launch  \
+# --multi_gpu  \
 accelerate launch  \
---multi_gpu  \
 --num_processes=1  \
 --mixed_precision=bf16  \
 /root/miniconda3/bin/lerobot-train \
@@ -26,7 +28,7 @@ accelerate launch  \
 --wandb.enable=true  \
 --policy.push_to_hub=false  \
 --steps=20000  \
---batch_size=16 \
+--batch_size=1 \
 --save_freq=2000  \
 --keep_last_n_checkpoints=3 \
 --policy.model_id=/root/autodl-fs/ckpts/models/Wan-AI/Wan2.2-TI2V-5B  \

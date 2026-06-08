@@ -605,7 +605,7 @@ class WanVideoDiT(WanModel):
         }
 
     def post_dit(self, x_tokens: torch.Tensor, pre_state: dict[str, Any]) -> torch.Tensor:
-        x = self.head(x_tokens, pre_state["t"])
+        x = self.head(x_tokens.to(torch.float32), pre_state["t"].to(torch.float32))
         return torch.stack(super().unpatchify(x, pre_state["meta"]["grid_sizes"]))
 
     def forward(

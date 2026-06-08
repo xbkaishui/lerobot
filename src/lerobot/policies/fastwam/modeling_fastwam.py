@@ -130,14 +130,14 @@ class FastWAMPolicy(PreTrainedPolicy):
         super()._save_pretrained(save_directory)
         _copy_wan_components_from_policy(policy=self, save_directory=save_directory)
 
-    def get_optim_params(self) -> dict[str, Any]:
+    def get_optim_params(self) -> list[torch.nn.Parameter]:
         params = (
             list(self.model.dit.parameters()) if hasattr(self.model, "dit") else list(self.model.parameters())
         )
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
             params.extend(list(proprio_encoder.parameters()))
-        return {"params": [p for p in params if p.requires_grad]}
+        return [p for p in params if p.requires_grad]
 
     def load_wan_components_from_pretrained(self, pretrained_name_or_path: str | Path) -> None:
         """Attach local Wan VAE, text encoder, and tokenizer from a HF directory.
@@ -153,6 +153,43 @@ class FastWAMPolicy(PreTrainedPolicy):
 
     def reset(self) -> None:
         self._action_queue: deque[Tensor] = deque([], maxlen=self.config.n_action_steps)
+        self._prompt_cache: dict[str, tuple[Tensor, Tensor]] = {}
+
+    def _encode_prompt_cached(self, task: str | list[str] | tuple[str, ...]) -> tuple[Tensor, Tensor]:
+        """Encode task text to context/context_mask with per-prompt caching."""
+        if isinstance(task, str):
+            prompts = [task]
+        else:
+            prompts = list(task)
+
+        contexts = []
+        masks = []
+        uncached_prompts = []
+        uncached_indices = []
+
+        for i, p in enumerate(prompts):
+            if p in self._prompt_cache:
+                ctx, msk = self._prompt_cache[p]
+                contexts.append(ctx)
+                masks.append(msk)
+            else:
+                uncached_prompts.append(p)
+                uncached_indices.append(i)
+                contexts.append(None)
+                masks.append(None)
+
+        if uncached_prompts:
+            with torch.no_grad():
+                new_ctx, new_mask = self.model.encode_prompt(uncached_prompts)
+                print(f"Encoded {uncached_prompts} to ctx shape {new_ctx.shape} mask shape {new_mask.shape}")
+            for j, idx in enumerate(uncached_indices):
+                ctx_j = new_ctx[j : j + 1]
+                mask_j = new_mask[j : j + 1]
+                self._prompt_cache[uncached_prompts[j]] = (ctx_j, mask_j)
+                contexts[idx] = ctx_j
+                masks[idx] = mask_j
+
+        return torch.cat(contexts, dim=0), torch.cat(masks, dim=0)
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Compute FastWAM training loss for a LeRobot batch.
@@ -161,18 +198,30 @@ class FastWAMPolicy(PreTrainedPolicy):
             batch (dict[str, Tensor]): Batch containing FastWAM-ready keys
                 (`video`, `action`, `context`, `context_mask`) or LeRobot keys
                 that can be adapted (`observation.images.*`, `observation.state`,
-                `action`, `action_is_pad`).
+                `action`, `action_is_pad`). If `context`/`context_mask` are not
+                present but `task` is, the model's text encoder encodes them
+                (with per-prompt caching to avoid redundant computation).
 
         Returns:
             dict[str, Tensor]: Output dictionary containing the scalar `loss`
             key required by LeRobot and optional tensor metrics.
         """
 
+        # Encode task text into context/context_mask if not precomputed
+        if "context" not in batch or "context_mask" not in batch:
+            # Use _prompt_from_batch to apply prompt_template, aligning with inference path
+            prompt = _prompt_from_batch(batch=batch, config=self.config)
+            if prompt is not None:
+                context, context_mask = self._encode_prompt_cached(prompt)
+                batch = dict(batch)  # shallow copy to avoid mutating caller's dict
+                batch["context"] = context
+                batch["context_mask"] = context_mask
+
         sample = _batch_to_training_sample(batch=batch, config=self.config)
         loss, metrics = self.model.training_loss(sample)
         output = {"loss": loss}
         output.update(_metrics_to_tensors(metrics=metrics, device=loss.device))
-        return output
+        return loss, output
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **_: Any) -> Tensor:
@@ -423,6 +472,7 @@ class _FastWAMVAEPlaceholder(torch.nn.Module):
 
 def _batch_to_training_sample(batch: dict[str, Tensor], config: FastWAMConfig) -> dict[str, Tensor]:
     sample = dict(batch)
+    # import ipdb; ipdb.set_trace();
     if "video" not in sample:
         sample["video"] = _stack_video_from_images(batch, config)
     if "proprio" not in sample and OBS_STATE in batch:

@@ -14,10 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from pathlib import Path
 
 import pytest
+import torch
 from torch import nn
+import time
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 
 from lerobot.policies.fastwam import modeling_fastwam
 from lerobot.policies.fastwam.configuration_fastwam import FastWAMConfig
@@ -165,8 +170,8 @@ def test_resolve_wan_checkpoint_paths_can_skip_text_encoder(tmp_path):
 
 def test_load_wan22_ti2v_5b_components():
     ckpt_path = '/root/autodl-fs/ckpts/models/Wan-AI/Wan2.2-TI2V-5B'
-    device: str = "cuda"
-    torch_dtype: str = "float16"
+    device: str = torch.device("cuda")
+    torch_dtype: str = torch.bfloat16
     video_dit_config: dict = {
         "patch_size": [1, 2, 2],
         "in_dim": 48,
@@ -196,7 +201,8 @@ def test_load_wan22_ti2v_5b_components():
             tokenizer_max_len=tokenizer_max_len,
             dit_config=video_dit_config,
             load_text_encoder=load_text_encoder,
-        )
+    )
+    time.sleep(100)
     
 if __name__ == "__main__":
     test_load_wan22_ti2v_5b_components()

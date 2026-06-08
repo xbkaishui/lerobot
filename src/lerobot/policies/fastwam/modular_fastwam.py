@@ -1523,6 +1523,8 @@ class FastWAM(torch.nn.Module):
         if self.proprio_encoder is not None:
             if proprio is None:
                 raise ValueError("`sample['proprio']` is required when `proprio_dim` is enabled.")
+            if proprio.ndim == 2:
+                proprio = proprio.unsqueeze(1)
             if proprio.ndim != 3:
                 raise ValueError(
                     f"`sample['proprio']` must be 3D [B, T, d], got shape {tuple(proprio.shape)}"

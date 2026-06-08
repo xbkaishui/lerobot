@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -138,10 +139,14 @@ def load_wan_video_dit(
 ) -> WanVideoDiT:
     from .wan_video_dit import WanVideoDiT
 
-    model = WanVideoDiT(**dit_config)
-    state_dict = _read_wan_dit_safetensors(paths)
-    model.load_state_dict(state_dict, strict=False)
-    return model.to(device=device, dtype=torch_dtype)
+    # Create model directly on target device/dtype to avoid extra CPU copies
+    with torch.device(device):
+        model = WanVideoDiT(**dit_config).to(dtype=torch_dtype)
+    # Load safetensors shards in parallel, directly to target device
+    state_dict = _read_wan_dit_safetensors(paths, device=device)
+    # Use assign=True to avoid allocating duplicate storage
+    model.load_state_dict(state_dict, strict=False, assign=True)
+    return model
 
 
 def load_wan_text_encoder(
@@ -158,9 +163,12 @@ def load_wan_text_encoder(
         dtype=torch_dtype,
         device=device,
     )
-    state_dict = torch.load(checkpoint_path, map_location="cpu")
-    model.load_state_dict(state_dict)
-    return model.to(device=device, dtype=torch_dtype)
+    # Use mmap=True for faster memory-mapped loading, load directly to target device
+    state_dict = torch.load(
+        checkpoint_path, map_location=device, mmap=True, weights_only=True
+    )
+    model.load_state_dict(state_dict, assign=True)
+    return model
 
 
 def load_wan_tokenizer(tokenizer_path: str | Path, *, tokenizer_max_len: int) -> HuggingfaceTokenizer:
@@ -203,33 +211,58 @@ def load_wan22_ti2v_5b_components(
         tokenizer_dir=tokenizer_dir,
         load_text_encoder=load_text_encoder,
     )
-    print(f'paths {paths}')
+    logger.info("Checkpoint paths resolved: %s", paths)
+
+    t0 = time.time()
     dit = load_wan_video_dit(
         paths.dit,
         dit_config=dit_config,
         torch_dtype=torch_dtype,
         device=device,
     )
+    logger.info("  DiT loaded in %.2f s", time.time() - t0)
+
+    t0 = time.time()
     vae = load_wan_vae(paths.vae, torch_dtype=torch_dtype, device=device)
+    logger.info("  VAE loaded in %.2f s", time.time() - t0)
 
     text_encoder: torch.nn.Module | None = None
     tokenizer: HuggingfaceTokenizer | None = None
     if load_text_encoder:
         if paths.text_encoder is None or paths.tokenizer is None:
             raise FileNotFoundError("Wan2.2 text encoder/tokenizer paths were not resolved.")
+        if device != "cpu" and torch.cuda.is_available():
+            mem_alloc = torch.cuda.memory_allocated() / 1024**3
+            mem_reserved = torch.cuda.memory_reserved() / 1024**3
+            logger.info(
+                "  [GPU Memory before text encoder] allocated=%.2f GiB, reserved=%.2f GiB",
+                mem_alloc, mem_reserved,
+            )
+        t0 = time.time()
         text_encoder = load_wan_text_encoder(
             paths.text_encoder,
             torch_dtype=torch_dtype,
             device=device,
         )
+        logger.info("  Text encoder loaded in %.2f s", time.time() - t0)
+        if device != "cpu" and torch.cuda.is_available():
+            mem_alloc = torch.cuda.memory_allocated() / 1024**3
+            mem_reserved = torch.cuda.memory_reserved() / 1024**3
+            logger.info(
+                "  [GPU Memory after text encoder] allocated=%.2f GiB, reserved=%.2f GiB",
+                mem_alloc, mem_reserved,
+            )
+
+        t0 = time.time()
         tokenizer = load_wan_tokenizer(paths.tokenizer, tokenizer_max_len=tokenizer_max_len)
+        logger.info("  Tokenizer loaded in %.2f s", time.time() - t0)
     else:
         logger.info(
             "Skipping pretrained text encoder/tokenizer load (`load_text_encoder=False`); "
             "training must provide cached `context/context_mask`."
         )
 
-    logger.info("Finished loading Wan2.2-TI2V-5B components in %.2f seconds.", time.time() - start)
+    logger.info("Finished loading Wan2.2-TI2V-5B components in %.2f s (total).", time.time() - start)
     return Wan22LoadedComponents(
         dit=dit,
         vae=vae,
@@ -242,10 +275,33 @@ def load_wan22_ti2v_5b_components(
     )
 
 
-def _read_wan_dit_safetensors(paths: list[str | Path]) -> dict[str, torch.Tensor]:
+def _read_wan_dit_safetensors(
+    paths: list[str | Path], *, device: str = "cpu"
+) -> dict[str, torch.Tensor]:
+    """Load multiple safetensors shards in parallel, then move to `device`.
+
+    Threads load to CPU (CUDA contexts are thread-local and unsafe in workers),
+    then the merged dict is transferred to the target device in the main thread.
+    """
+    if len(paths) <= 1:
+        # Single shard: load directly to target device, no thread needed
+        state_dict: dict[str, torch.Tensor] = {}
+        for path in paths:
+            state_dict.update(load_file(str(path), device=device))
+        return state_dict
+
+    # Multiple shards: parallel IO to CPU, then move to device
+    def _load_shard_cpu(path: str | Path) -> dict[str, torch.Tensor]:
+        return load_file(str(path), device="cpu")
+
     state_dict = {}
-    for path in paths:
-        state_dict.update(load_file(str(path), device="cpu"))
+    with ThreadPoolExecutor(max_workers=min(len(paths), 4)) as executor:
+        for shard in executor.map(_load_shard_cpu, paths):
+            state_dict.update(shard)
+
+    # Move to target device in main thread if needed
+    if device != "cpu":
+        state_dict = {k: v.to(device=device, non_blocking=True) for k, v in state_dict.items()}
     return state_dict
 
 
