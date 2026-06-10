@@ -131,7 +131,7 @@ class FastWAMPolicy(PreTrainedPolicy):
         return policy
 
     def _save_pretrained(self, save_directory: Path) -> None:
-        super()._save_pretrained(save_directory)
+        _save_fastwam_pretrained(self, save_directory)
         _copy_wan_components_from_policy(policy=self, save_directory=save_directory)
 
     def get_optim_params(self) -> list[torch.nn.Parameter]:
@@ -280,8 +280,7 @@ class FastWAMPolicy(PreTrainedPolicy):
 
         sample = _batch_to_training_sample(batch=batch, config=self.config)
         loss, metrics = self.model.training_loss(sample)
-        output = {"loss": loss}
-        output.update(_metrics_to_tensors(metrics=metrics, device=loss.device))
+        output = _metrics_to_scalars(metrics)
         return loss, output
 
     @torch.no_grad()
@@ -325,6 +324,41 @@ class FastWAMPolicy(PreTrainedPolicy):
 
     def _build_core_model(self, config: FastWAMConfig) -> torch.nn.Module:
         return _build_core_model_from_wan22(config)
+
+
+def _save_fastwam_pretrained(policy: FastWAMPolicy, save_directory: Path) -> None:
+    """Save FastWAM model with deduplicated state_dict to avoid safetensors shared-tensor errors.
+
+    FastWAM stores the same module under multiple attribute paths (video_expert,
+    mot.mixtures.video, dit.mixtures.video). We keep only the `model.mot.*` prefix
+    as canonical to avoid duplicate tensor storage.
+    """
+    from safetensors.torch import save_file
+    from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+
+    policy.config._save_pretrained(save_directory)
+    model_to_save = policy.module if hasattr(policy, "module") else policy
+    state_dict = model_to_save.state_dict()
+
+    # Deduplicate: remove alias paths that point to the same underlying storage.
+    # Canonical prefix is `model.mot.*`; remove `model.video_expert.*`,
+    # `model.action_expert.*`, and `model.dit.*` aliases.
+    # Also remove frozen components (vae, text_encoder) that are loaded separately.
+    skip_prefixes = (
+        "model.video_expert.",
+        "model.action_expert.",
+        "model.dit.",
+        "model.vae.",
+        "model.text_encoder.",
+    )
+    deduped = {k: v for k, v in state_dict.items() if not k.startswith(skip_prefixes)}
+
+    _logger.info(
+        "Saving FastWAM: %d keys (removed %d alias keys)",
+        len(deduped),
+        len(state_dict) - len(deduped),
+    )
+    save_file(deduped, str(save_directory / SAFETENSORS_SINGLE_FILE))
 
 
 def _resolve_pretrained_directory(
@@ -410,6 +444,7 @@ def _record_wan_component_paths(policy: FastWAMPolicy, paths: WanCheckpointPaths
 
 
 def _copy_wan_components_from_policy(policy: FastWAMPolicy, save_directory: Path) -> None:
+    # import ipdb; ipdb.set_trace();
     model_paths = getattr(policy.model, "model_paths", {}) or {}
     paths = {
         "vae": model_paths.get("vae"),
@@ -422,8 +457,9 @@ def _copy_wan_components_from_policy(policy: FastWAMPolicy, save_directory: Path
             "FastWAM save_pretrained requires local Wan component paths for "
             f"{missing}. Load or initialize the policy with local Wan VAE, text encoder, and tokenizer files."
         )
-    _copy_component_path(Path(paths["vae"]), save_directory / Path(paths["vae"]).name)
-    _copy_component_path(Path(paths["text_encoder"]), save_directory / Path(paths["text_encoder"]).name)
+    # TODO enable later
+    # _copy_component_path(Path(paths["vae"]), save_directory / Path(paths["vae"]).name)
+    # _copy_component_path(Path(paths["text_encoder"]), save_directory / Path(paths["text_encoder"]).name)
     tokenizer_source = Path(paths["tokenizer"])
     _copy_component_path(tokenizer_source, save_directory / "google" / "umt5-xxl")
 
@@ -616,6 +652,21 @@ def _dtype_from_name(name: str) -> torch.dtype:
     if name not in dtype_map:
         raise ValueError(f"Unsupported torch dtype `{name}`.")
     return dtype_map[name]
+
+
+def _metrics_to_scalars(metrics: dict[str, Any] | None) -> dict[str, float]:
+    """Convert metrics dict to plain Python floats for wandb/swanlab logging."""
+    if metrics is None:
+        return {}
+    result = {}
+    for key, value in metrics.items():
+        if isinstance(value, Tensor):
+            result[key] = value.detach().item()
+        elif isinstance(value, (int, float)):
+            result[key] = float(value)
+        else:
+            result[key] = float(value)
+    return result
 
 
 def _metrics_to_tensors(metrics: dict[str, Any] | None, device: torch.device) -> dict[str, Tensor]:

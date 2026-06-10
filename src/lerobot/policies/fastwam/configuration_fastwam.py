@@ -180,7 +180,7 @@ class FastWAMConfig(PreTrainedConfig):
     invert_dimensions: list[int] = field(default_factory=list)
     normalization_mapping: dict[str, Any] = field(
         default_factory=lambda: {
-            "VISUAL": NormalizationMode.MEAN_STD,
+            "VISUAL": NormalizationMode.IDENTITY,
             "STATE": NormalizationMode.MEAN_STD,
             "ACTION": NormalizationMode.MEAN_STD,
         }

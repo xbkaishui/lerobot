@@ -103,8 +103,8 @@ def resolve_wan_checkpoint_paths(
     tokenizer_root = Path(tokenizer_dir).expanduser() if tokenizer_dir is not None else root
     dit = sorted(root.glob(WAN_DIT_PATTERN)) if load_dit else []
     vae = root / WAN_VAE_CHECKPOINT
-    text_encoder = root / WAN_T5_CHECKPOINT if load_text_encoder else None
-    tokenizer = tokenizer_root / WAN_T5_TOKENIZER if load_text_encoder else None
+    text_encoder = root / WAN_T5_CHECKPOINT
+    tokenizer = tokenizer_root / WAN_T5_TOKENIZER
 
     missing = []
     if load_dit and len(dit) == 0:

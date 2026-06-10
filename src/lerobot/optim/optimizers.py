@@ -301,12 +301,22 @@ def save_optimizer_state(
 
 
 def _save_single_optimizer_state(optimizer: torch.optim.Optimizer, save_dir: Path) -> None:
-    """Save a single optimizer's state to disk."""
+    """Save a single optimizer's state to disk.
+
+    Handles both standard PyTorch optimizers (with `param_groups` key) and
+    DeepSpeed-wrapped optimizers whose state_dict may have a different structure.
+    """
     state = optimizer.state_dict()
-    param_groups = state.pop("param_groups")
-    flat_state = flatten_dict(state)
-    save_file(flat_state, save_dir / OPTIMIZER_STATE)
-    write_json(param_groups, save_dir / OPTIMIZER_PARAM_GROUPS)
+    if "param_groups" in state:
+        param_groups = state.pop("param_groups")
+        flat_state = flatten_dict(state)
+        save_file(flat_state, save_dir / OPTIMIZER_STATE)
+        write_json(param_groups, save_dir / OPTIMIZER_PARAM_GROUPS)
+    else:
+        # DeepSpeed-wrapped optimizer: state_dict lacks standard param_groups.
+        # Fall back to torch.save for the entire state.
+        save_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(state, save_dir / "optimizer_state.pt")
 
 
 def load_optimizer_state(
@@ -337,7 +347,18 @@ def load_optimizer_state(
 
 
 def _load_single_optimizer_state(optimizer: torch.optim.Optimizer, save_dir: Path) -> torch.optim.Optimizer:
-    """Load a single optimizer's state from disk."""
+    """Load a single optimizer's state from disk.
+
+    Handles both standard format (safetensors + param_groups JSON) and
+    DeepSpeed fallback format (optimizer_state.pt).
+    """
+    deepspeed_path = save_dir / "optimizer_state.pt"
+    if deepspeed_path.exists():
+        # DeepSpeed fallback format
+        state = torch.load(deepspeed_path, map_location="cpu", weights_only=False)
+        optimizer.load_state_dict(state)
+        return optimizer
+
     current_state_dict = optimizer.state_dict()
     flat_state = load_file(save_dir / OPTIMIZER_STATE)
     state = unflatten_dict(flat_state)

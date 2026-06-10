@@ -31,7 +31,7 @@ accelerate launch  \
 --policy.push_to_hub=false  \
 --steps=20000  \
 --batch_size=16 \
---save_freq=2000  \
+--save_freq=1000  \
 --keep_last_n_checkpoints=3 \
 --policy.use_torch_compile=true \
 --policy.use_gradient_checkpointing=true \
@@ -39,4 +39,5 @@ accelerate launch  \
 --policy.load_text_encoder=false \
 --policy.model_id=/root/autodl-fs/ckpts/models/Wan-AI/Wan2.2-TI2V-5B  \
 --policy.tokenizer_model_id=/root/autodl-fs/ckpts/models/Wan-AI/Wan2.2-TI2V-5B  \
+--policy.normalization_mapping='{"ACTION": "MEAN_STD", "STATE": "MEAN_STD", "VISUAL": "IDENTITY"}'  \
 --num_workers=16
