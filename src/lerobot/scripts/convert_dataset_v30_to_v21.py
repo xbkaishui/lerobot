@@ -123,12 +123,29 @@ meta/info.json
 """
 
 
+def _convert_numpy_to_native(obj):
+    """Recursively convert numpy types to Python native types for JSON serialization."""
+    if isinstance(obj, np.ndarray):
+        return [_convert_numpy_to_native(x) for x in obj.tolist()]
+    elif isinstance(obj, (np.floating, np.float16, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, (np.integer, np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, dict):
+        return {k: _convert_numpy_to_native(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_convert_numpy_to_native(x) for x in obj]
+    return obj
+
+
 def write_jsonlines(fpath: Path, data: list[dict]) -> None:
     """Write a list of dicts to a jsonlines file."""
     fpath.parent.mkdir(parents=True, exist_ok=True)
     with jsonlines.open(fpath, mode="w") as writer:
         for item in data:
-            writer.write(item)
+            writer.write(_convert_numpy_to_native(item))
 
 
 def load_episodes_full(local_dir: Path) -> Dataset:
@@ -460,15 +477,15 @@ def convert_dataset(
         use_local_dataset = True
         print(f"Using local dataset at {root}")
 
-    if not use_local_dataset:
-        print(f"Downloading v3.0 dataset from hub: {repo_id}")
-        snapshot_download(
-            repo_id,
-            repo_type="dataset",
-            revision=V30,
-            local_dir=root,
-        )
-        validate_local_dataset_version(root)
+    # if not use_local_dataset:
+    #     print(f"Downloading v3.0 dataset from hub: {repo_id}")
+    #     snapshot_download(
+    #         repo_id,
+    #         repo_type="dataset",
+    #         revision=V30,
+    #         local_dir=root,
+    #     )
+    #     validate_local_dataset_version(root)
 
     old_root = root.parent / f"{root.name}_v30_backup"
     new_root = root.parent / f"{root.name}_v21"
@@ -527,7 +544,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--repo-id",
         type=str,
-        required=True,
+        required=False,
         help="Repository identifier on Hugging Face: a community or a user name `/` the name of the dataset "
         "(e.g. `lerobot/pusht`, `<USER>/aloha_sim_insertion_human`).",
     )
